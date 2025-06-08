@@ -1,19 +1,17 @@
 #!/bin/bash
 
-# 磁盘性能测试脚本（修复版）
-# 修复ASCII艺术字显示问题
+# 磁盘性能测试脚本（终极修复版）
+# 解决读取测试失败和进度条显示异常问题
 
 # 颜色与样式
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-MAGENTA='\033[0;35m'
-CYAN='\033[0;36m'
-NC='\033[0m'  # 恢复默认
-BAR_LENGTH=50  # 进度条长度
+NC='\033[0m'
+BAR_LENGTH=50
 
-# 修复后的艺术字（使用双反斜杠转义）
+# ASCII 艺术字
 print_header() {
     echo -e "${BLUE}
    _____            __  __            _       _     
@@ -49,25 +47,21 @@ setup_params() {
     TEST_DIR="${TEST_DIR:-/home/sunset1014/test_dir}"
     LOG_DIR="$TEST_DIR/logs"
     TEST_FILE="$TEST_DIR/fio.test"
-    TEST_SIZE="4G"         # 虚拟机环境增大测试文件
-    RUNTIME="60"          # 每项测试运行时间（秒）
-    IOENGINE="sync"       # 虚拟机环境使用 sync IO
-    DISK="/dev/sda"       # 默认测试磁盘
+    TEST_SIZE="4G"
+    RUNTIME="60"
+    DISK="/dev/sda"
 }
 
-# 打印优雅进度条
+# 打印优雅进度条（修复版）
 print_progress() {
-    local current=$1; local total=$2; local status=$3
-    local percent=$((current * 100 / total))
-    local filled=$((percent * BAR_LENGTH / 100))
+    local percent=$1; local max=$2; local status=$3
+    local filled=$((percent * BAR_LENGTH / max))
     local empty=$((BAR_LENGTH - filled))
     
-    # 构建进度条
     local bar="${BLUE}[${GREEN}$(printf "%-${filled}s" "" | tr ' ' '#')${BLUE}$(printf "%-${empty}s" "" | tr ' ' '-')${BLUE}]${NC}"
     
-    # 彩色百分比
-    if [ $percent -eq 100 ]; then
-        percent="${GREEN}100${NC}"
+    if [ $percent -eq $max ]; then
+        percent="${GREEN}${percent}${NC}"
     else
         percent="${BLUE}${percent}${NC}"
     fi
@@ -75,7 +69,7 @@ print_progress() {
     echo -ne "${bar} ${percent}% ${status}...${NC}\r"
 }
 
-# 执行测试并显示进度
+# 执行测试并显示进度（修复版）
 run_test() {
     local name=$1; shift
     local params="$*"
@@ -84,26 +78,34 @@ run_test() {
     
     echo -e "${BLUE}开始 ${name} 测试...${NC}"
     
-    # 执行测试并捕获PID
-    fio --name="${name}" --filename="$TEST_FILE" --size="$TEST_SIZE" --runtime="$RUNTIME" \
-        --ioengine="$IOENGINE" $params --output-format=json > "$log_file" 2>"$err_file" &
-    local pid=$!
+    # 清理缓存并重建测试文件
+    sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'
+    rm -f "$TEST_FILE"
     
-    # 实时更新进度
+    # 执行测试
+    fio --name="${name}" --filename="$TEST_FILE" --size="$TEST_SIZE" --runtime="$RUNTIME" \
+        --output-format=json $params > "$log_file" 2>"$err_file" &
+    
+    local pid=$!
     local start_time=$(date +%s)
+    
     while kill -0 $pid 2>/dev/null; do
         local elapsed=$(( $(date +%s) - start_time ))
         local percent=$(( elapsed * 100 / RUNTIME ))
-        if [ $percent -gt 100 ]; then percent=100; fi
-        print_progress $elapsed $RUNTIME "$name"
+        
+        # 确保百分比不超过100
+        if [ $percent -gt 100 ]; then
+            percent=100
+        fi
+        
+        print_progress $percent 100 "$name"
         sleep 1
     done
     
-    # 确保显示100%完成
-    print_progress $RUNTIME $RUNTIME "$name ${GREEN}完成${NC}"
+    # 确保最终显示100%完成
+    print_progress 100 100 "$name ${GREEN}完成${NC}"
     echo
     
-    # 检查测试状态
     if [ $? -ne 0 ] || [ ! -s "$log_file" ]; then
         echo -e "${RED}${name} 测试失败！错误日志: ${err_file}${NC}"
         return 1
@@ -122,22 +124,26 @@ parse_result() {
         return 1
     fi
     
-    # 提取关键指标
+    # 检查JSON文件是否有效
+    if ! jq empty "$log_file" >/dev/null 2>&1; then
+        echo -e "${RED}${name} 结果文件格式错误！${NC}"
+        echo -e "${YELLOW}错误详情:${NC}"
+        jq "$log_file" 2>&1 | sed 's/^/  /'
+        return 1
+    fi
+    
     local bw=$(jq -r ".jobs[0].write.bw // .jobs[0].read.bw" "$log_file")
     local iops=$(jq -r ".jobs[0].write.iops // .jobs[0].read.iops" "$log_file")
     local lat=$(jq -r ".jobs[0].write.lat.nsec.mean // .jobs[0].read.lat.nsec.mean" "$log_file")
     
-    # 转换单位
     local bw_mb=$(echo "scale=2; $bw / 1024" | bc -l)
     local lat_ms=$(echo "scale=2; $lat / 1000000" | bc -l)
     
-    # 输出结果
     echo -e "${BLUE}→ ${name} 测试结果:${NC}"
     echo -e "  ${GREEN}带宽: ${bw_mb} MB/s${NC}"
     echo -e "  ${GREEN}IOPS: ${iops}${NC}"
     echo -e "  ${GREEN}平均延迟: ${lat_ms} ms${NC}"
     
-    # 提供性能参考
     local disk_type=$(lsblk -d -o ROTA "$DISK" | tail -n1 | sed 's/0/SSD/;s/1/HDD/')
     if [ "$disk_type" = "SSD" ]; then
         echo -e "  ${YELLOW}SSD 参考: 顺序读写 > 300 MB/s, 随机 4K 读写 > 10,000 IOPS${NC}"
@@ -154,49 +160,70 @@ main() {
     detect_vm
     setup_params
     
-    # 创建目录
     mkdir -p "$TEST_DIR" "$LOG_DIR" || { echo -e "${RED}无法创建测试目录！${NC}"; exit 1; }
     rm -f "$TEST_FILE"
     
-    # 定义测试场景
+    # 优化的测试参数（针对虚拟机环境）
     local test_names=("顺序写入" "顺序读取" "随机写入" "随机读取" "混合读写")
     local test_params=(
-        "--rw=write --bs=1M --iodepth=1 --numjobs=1"
-        "--rw=read --bs=1M --iodepth=1 --numjobs=1"
-        "--rw=randwrite --bs=4k --iodepth=4 --numjobs=2"
-        "--rw=randread --bs=4k --iodepth=4 --numjobs=2"
-        "--rw=randrw --bs=4k --iodepth=4 --numjobs=2 --rwmixread=70"
+        "--rw=write --bs=1M --iodepth=1 --numjobs=1 --ioengine=sync --direct=1"  # 直接IO
+        "--rw=read --bs=1M --iodepth=16 --numjobs=1 --ioengine=libaio --direct=1"  # 读取使用libaio
+        "--rw=randwrite --bs=4k --iodepth=8 --numjobs=1 --ioengine=libaio --direct=1"
+        "--rw=randread --bs=4k --iodepth=8 --numjobs=1 --ioengine=libaio --direct=1"
+        "--rw=randrw --bs=4k --iodepth=8 --numjobs=1 --ioengine=libaio --direct=1 --rwmixread=70"
     )
     
-    # 执行所有测试
     local failed=0
     for ((i=0; i<${#test_names[@]}; i++)); do
         run_test "${test_names[$i]}" "${test_params[$i]}" || ((failed++))
     done
     
-    # 输出测试报告
     echo -e "\n${BLUE}================= 测试报告 ================${NC}"
     echo -e "${GREEN}磁盘: ${DISK} (类型: $(lsblk -d -o ROTA "$DISK" | tail -n1 | sed 's/0/SSD/;s/1/HDD/'))${NC}"
     echo -e "${GREEN}测试文件: ${TEST_SIZE} | 运行时间: ${RUNTIME}秒/测试${NC}"
     echo -e "${BLUE}==========================================${NC}\n"
     
-    # 解析每个测试结果
     for ((i=0; i<${#test_names[@]}; i++)); do
-        local log_file="$LOG_DIR/${test_names[$i]}.json"
-        parse_result "${test_names[$i]}" "$log_file"
+        parse_result "${test_names[$i]}" "$LOG_DIR/${test_names[$i]}.json"
     done
     
-    # 性能评分
+    # 改进的性能评分
     if [ $failed -eq 0 ]; then
-        echo -e "${BLUE}\n性能评分: ${GREEN}PASS${NC} (所有测试成功完成)"
+        local all_valid=1
+        for name in "${test_names[@]}"; do
+            local log="$LOG_DIR/${name}.json"
+            if [ ! -s "$log" ] || ! jq empty "$log" >/dev/null 2>&1; then
+                all_valid=0
+                break
+            fi
+        done
+        
+        if [ $all_valid -eq 1 ]; then
+            # 检查关键指标是否为0
+            local has_zero=0
+            for name in "${test_names[@]}"; do
+                local log="$LOG_DIR/${name}.json"
+                local bw=$(jq -r ".jobs[0].write.bw // .jobs[0].read.bw" "$log")
+                if [ "$bw" = "0" ]; then
+                    has_zero=1
+                    echo -e "${YELLOW}警告: ${name} 带宽为0，结果可能异常${NC}"
+                fi
+            done
+            
+            if [ $has_zero -eq 0 ]; then
+                echo -e "${BLUE}\n性能评分: ${GREEN}PASS${NC} (所有测试成功完成)"
+            else
+                echo -e "${BLUE}\n性能评分: ${YELLOW}WARNING${NC} (部分测试结果异常但无错误)"
+            fi
+        else
+            echo -e "${BLUE}\n性能评分: ${RED}FAIL${NC} (部分测试结果无效)"
+        fi
     else
         echo -e "${BLUE}\n性能评分: ${RED}FAIL${NC} (${failed}项测试失败)"
     fi
     
-    # 清理临时文件
     rm -f "$TEST_FILE"
     echo -e "${BLUE}\n测试完成！详细日志保存在: ${LOG_DIR}${NC}"
 }
 
-# 执行主函数
 main
